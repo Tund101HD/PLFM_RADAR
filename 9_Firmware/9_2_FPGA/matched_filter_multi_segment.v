@@ -194,33 +194,8 @@ always @(posedge clk or negedge reset_n) begin
                         `endif
                     end
                     
-                    // Check conditions based on chirp type
-                    if (use_long_chirp) begin
-                        // LONG CHIRP: Process when we have SEGMENT_ADVANCE new samples
-                        // (buffer contains overlap from previous segment + new data)
-                        
-                        // Check if we have enough NEW data to process
-                        if (buffer_write_ptr >= SEGMENT_ADVANCE) begin
-                            buffer_has_data <= 1;
-                            state <= ST_WAIT_REF;
-                            segment_request <= current_segment[1:0];  // Use lower 2 bits
-                            mem_request <= 1;
-                            
-                            `ifdef SIMULATION
-                            $display("[MULTI_SEG_FIXED] Segment %d ready: %d samples collected",
-                                     current_segment, chirp_samples_collected);
-                            `endif
-                        end
-                        
-                        // Check if end of chirp reached
-                        if (chirp_samples_collected >= LONG_CHIRP_SAMPLES - 1) begin
-                            chirp_complete <= 1;
-                            `ifdef SIMULATION
-                            $display("[MULTI_SEG_FIXED] End of long chirp reached");
-                            `endif
-                        end
-                    end else begin
-                        // SHORT CHIRP: Only 50 samples, then zero-pad
+                    // SHORT CHIRP: Only 50 samples, then zero-pad
+                    if (!use_long_chirp) begin
                         if (chirp_samples_collected >= SHORT_CHIRP_SAMPLES - 1) begin
                             state <= ST_ZERO_PAD;
                             `ifdef SIMULATION
@@ -228,6 +203,31 @@ always @(posedge clk or negedge reset_n) begin
                                      chirp_samples_collected + 1);
                             `endif
                         end
+                    end
+                end
+                
+                // LONG CHIRP: segment-ready and chirp-complete checks
+                // evaluated every clock (not gated by ddc_valid) to avoid
+                // missing the transition when buffer_write_ptr updates via
+                // non-blocking assignment one cycle after the last write.
+                if (use_long_chirp) begin
+                    if (buffer_write_ptr >= SEGMENT_ADVANCE) begin
+                        buffer_has_data <= 1;
+                        state <= ST_WAIT_REF;
+                        segment_request <= current_segment[1:0];
+                        mem_request <= 1;
+                        
+                        `ifdef SIMULATION
+                        $display("[MULTI_SEG_FIXED] Segment %d ready: %d samples collected",
+                                 current_segment, chirp_samples_collected);
+                        `endif
+                    end
+                    
+                    if (chirp_samples_collected >= LONG_CHIRP_SAMPLES && !chirp_complete) begin
+                        chirp_complete <= 1;
+                        `ifdef SIMULATION
+                        $display("[MULTI_SEG_FIXED] End of long chirp reached");
+                        `endif
                     end
                 end
             end

@@ -112,6 +112,7 @@ assign mem_read_addr = (read_doppler_index * RANGE_BINS) + read_range_bin;
 reg [2:0] state;
 localparam S_IDLE       = 3'b000;
 localparam S_ACCUMULATE = 3'b001;
+localparam S_PRE_READ   = 3'b101;  // Prime BRAM pipeline before FFT load
 localparam S_LOAD_FFT   = 3'b010;
 localparam S_FFT_WAIT   = 3'b011;
 localparam S_OUTPUT     = 3'b100;
@@ -230,43 +231,97 @@ always @(posedge clk or negedge reset_n) begin
                         if (write_chirp_index >= CHIRPS_PER_FRAME - 1) begin
                             frame_buffer_full <= 1;
                             chirp_state <= 0;
-                            state <= S_LOAD_FFT;
+                            state <= S_PRE_READ;
                             read_range_bin <= 0;
                             read_doppler_index <= 0;
                             fft_sample_counter <= 0;
-                            fft_start <= 1;
                         end
                     end
                 end 
             end
             
+            S_PRE_READ: begin
+                // Prime the BRAM pipeline: present addr for chirp 0 of
+                // current read_range_bin.  read_doppler_index is already 0.
+                // mem_read_addr = 0 * RANGE_BINS + read_range_bin.
+                // After this cycle, mem_rdata_i will hold data[chirp=0][rbin].
+                // Advance read_doppler_index to 1 so the NEXT BRAM read
+                // (which happens every cycle in the memory block) will
+                // fetch chirp 1.
+                read_doppler_index <= 1;
+                fft_start <= 1;
+                state <= S_LOAD_FFT;
+            end
+
             S_LOAD_FFT: begin
                 fft_start <= 0;
                 
-                if (fft_sample_counter < DOPPLER_FFT_SIZE) begin
-                    // Use registered read data (one cycle latency from BRAM)
+                // Pipeline alignment (after S_PRE_READ primed the BRAM):
+                //
+                // At cycle k (fft_sample_counter = k, k = 0..31):
+                //   mem_rdata_i = data[chirp=k][rbin]  (from addr presented
+                //                 LAST cycle: read_doppler_index was k)
+                //   We compute: mult_i <= mem_rdata_i * window_coeff[k]
+                //   We capture: fft_input_i <= (prev_mult_i + round) >>> 15
+                //   We present: BRAM addr for chirp k+1 (for next cycle)
+                //
+                // For k=0: fft_input_i captures the stale mult_i (= 0 from
+                //          reset or previous rbin's flush).  This is WRONG
+                //          for a naive implementation.  Instead, we use a
+                //          sub-counter approach:
+                //
+                //   sub=0 (pre-multiply): We have mem_rdata_i = data[0].
+                //         Compute mult_i = data[0] * window[0].
+                //         Do NOT assert fft_input_valid yet.
+                //         Present BRAM addr for chirp 1.
+                //
+                //   sub=1..31 (normal): mem_rdata_i = data[sub].
+                //         fft_input_i = (prev mult) >>> 15  -> VALID
+                //         mult_i = data[sub] * window[sub]
+                //         Present BRAM addr for chirp sub+1.
+                //
+                //   sub=32 (flush): No new BRAM data needed.
+                //         fft_input_i = (mult from sub=31) >>> 15  -> VALID, LAST
+                //         Transition to S_FFT_WAIT.
+                //
+                // We reuse fft_sample_counter as the sub-counter (0..32).
+
+                if (fft_sample_counter == 0) begin
+                    // Sub 0: pre-multiply.  mem_rdata_i = data[chirp=0][rbin].
                     mult_i <= $signed(mem_rdata_i) *
-                                   $signed(window_coeff[read_doppler_index]);
+                                   $signed(window_coeff[0]);
                     mult_q <= $signed(mem_rdata_q) *
-                                   $signed(window_coeff[read_doppler_index]);
-                    
-                    // Round instead of truncate
+                                   $signed(window_coeff[0]);
+                    // Present BRAM addr for chirp 2 (sub=1 reads chirp 1
+                    // from the BRAM read we triggered in S_PRE_READ;
+                    // we need chirp 2 ready for sub=2).
+                    read_doppler_index <= 2;
+                    fft_sample_counter <= 1;
+                end else if (fft_sample_counter <= DOPPLER_FFT_SIZE) begin
+                    // Sub 1..32
+                    // Capture previous mult into fft_input
                     fft_input_i <= (mult_i + (1 << 14)) >>> 15;
                     fft_input_q <= (mult_q + (1 << 14)) >>> 15;
-                    
                     fft_input_valid <= 1;
-                    
-                    if (fft_sample_counter == DOPPLER_FFT_SIZE - 1) begin
+
+                    if (fft_sample_counter == DOPPLER_FFT_SIZE) begin
+                        // Sub 32: flush last sample
                         fft_input_last <= 1;
+                        state <= S_FFT_WAIT;
+                        fft_sample_counter <= 0;
+                        processing_timeout <= 1000;
+                    end else begin
+                        // Sub 1..31: also compute new mult from current BRAM data
+                        // mem_rdata_i = data[chirp = fft_sample_counter][rbin]
+                        mult_i <= $signed(mem_rdata_i) *
+                                       $signed(window_coeff[fft_sample_counter]);
+                        mult_q <= $signed(mem_rdata_q) *
+                                       $signed(window_coeff[fft_sample_counter]);
+                        // Advance BRAM read to chirp fft_sample_counter+2
+                        // (so data is ready two cycles later when we need it)
+                        read_doppler_index <= fft_sample_counter + 2;
+                        fft_sample_counter <= fft_sample_counter + 1;
                     end
-                    
-                    // Increment chirp index for next sample
-                    read_doppler_index <= read_doppler_index + 1;
-                    fft_sample_counter <= fft_sample_counter + 1;
-                end else begin
-                    state <= S_FFT_WAIT;
-                    fft_sample_counter <= 0;
-                    processing_timeout <= 100;
                 end
             end
             
@@ -294,8 +349,8 @@ always @(posedge clk or negedge reset_n) begin
                 if (read_range_bin < RANGE_BINS - 1) begin
                     read_range_bin <= read_range_bin + 1;
                     read_doppler_index <= 0;
-                    state <= S_LOAD_FFT;
-                    fft_start <= 1;
+                    fft_sample_counter <= 0;
+                    state <= S_PRE_READ;
                 end else begin
                     state <= S_IDLE;
                     frame_buffer_full <= 0;
