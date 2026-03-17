@@ -7,17 +7,43 @@
 //     -> matched_filter_multi_segment -> range_bin_decimator
 //     -> doppler_processor_optimized -> doppler_output
 //
+// ============================================================================
+// TWO MODES (compile-time define):
+//
+//   1. GOLDEN_GENERATE mode  (-DGOLDEN_GENERATE):
+//      Dumps all Doppler output samples to golden reference files.
+//      Run once on known-good RTL:
+//        iverilog -g2001 -DSIMULATION -DGOLDEN_GENERATE -o tb_golden_gen.vvp \
+//          <src files> tb/tb_radar_receiver_final.v
+//        mkdir -p tb/golden
+//        vvp tb_golden_gen.vvp
+//
+//   2. Default mode (no GOLDEN_GENERATE):
+//      Loads golden files, compares each Doppler output against reference,
+//      and runs physics-based bounds checks.
+//        iverilog -g2001 -DSIMULATION -o tb_radar_receiver_final.vvp \
+//          <src files> tb/tb_radar_receiver_final.v
+//        vvp tb_radar_receiver_final.vvp
+//
+// PREREQUISITES:
+//   - The directory tb/golden/ must exist before running either mode.
+//     Create it with: mkdir -p tb/golden
+//
+// TAP POINTS:
+//   Tap 1 (DDC output)     - bounds checking only (CDC jitter -> non-deterministic)
+//     Signals: dut.ddc_out_i [17:0], dut.ddc_out_q [17:0], dut.ddc_valid_i
+//   Tap 2 (Doppler output) - golden compared (deterministic after MF buffering)
+//     Signals: doppler_output[31:0], doppler_valid, doppler_bin[4:0],
+//              range_bin_out[5:0]
+//
+// Golden file: tb/golden/golden_doppler.mem
+//   2048 entries of 32-bit hex, indexed by range_bin*32 + doppler_bin
+//
 // Strategy:
 //   - Uses behavioral stub for ad9484_interface_400m (no Xilinx primitives)
 //   - Overrides radar_mode_controller timing params for fast simulation
 //   - Feeds 120 MHz tone at ADC input (IF frequency -> DDC passband)
-//   - Verifies structural correctness of Doppler outputs:
-//     * Outputs appear (doppler_valid asserted)
-//     * Correct output count per frame (64 range bins x 32 Doppler bins = 2048)
-//     * Range bin index covers 0..63
-//     * Doppler bin index covers 0..31
-//     * Output values are non-trivial (not all zeros)
-//   - Does NOT require bit-perfect match (too many cascaded stages)
+//   - Verifies structural correctness + golden comparison + bounds checks
 //
 // Convention: check task, VCD dump, CSV output, pass/fail summary
 // ============================================================================
@@ -147,7 +173,69 @@ task check;
 endtask
 
 // ============================================================================
-// OUTPUT MONITORING
+// GOLDEN MEMORY DECLARATIONS AND LOAD/STORE LOGIC
+// ============================================================================
+localparam GOLDEN_ENTRIES   = 2048;  // 64 range bins * 32 Doppler bins
+localparam GOLDEN_TOLERANCE = 2;     // +/- 2 LSB tolerance for comparison
+
+reg [31:0] golden_doppler [0:2047];
+
+// -- Golden comparison tracking --
+integer golden_match_count;
+integer golden_mismatch_count;
+integer golden_max_err_i;
+integer golden_max_err_q;
+integer golden_compare_count;
+
+`ifdef GOLDEN_GENERATE
+    // In generate mode, we just initialize the array to X/0
+    // and fill it as outputs arrive
+    integer gi;
+    initial begin
+        for (gi = 0; gi < GOLDEN_ENTRIES; gi = gi + 1)
+            golden_doppler[gi] = 32'd0;
+        golden_match_count   = 0;
+        golden_mismatch_count = 0;
+        golden_max_err_i     = 0;
+        golden_max_err_q     = 0;
+        golden_compare_count = 0;
+    end
+`else
+    // In comparison mode, load the golden reference
+    initial begin
+        $readmemh("tb/golden/golden_doppler.mem", golden_doppler);
+        golden_match_count   = 0;
+        golden_mismatch_count = 0;
+        golden_max_err_i     = 0;
+        golden_max_err_q     = 0;
+        golden_compare_count = 0;
+    end
+`endif
+
+// ============================================================================
+// DDC ENERGY ACCUMULATOR (Bounds Check B1)
+// ============================================================================
+// Accumulate I^2 + Q^2 for all DDC valid samples. 64-bit to avoid overflow.
+// DDC outputs are 18-bit signed -> squared max ~ 2^34, sum of many -> need 64-bit.
+reg [63:0] ddc_energy_acc;
+integer    ddc_sample_count;
+
+initial begin
+    ddc_energy_acc  = 64'd0;
+    ddc_sample_count = 0;
+end
+
+always @(posedge clk_100m) begin
+    if (reset_n && dut.ddc_valid_i) begin
+        ddc_energy_acc <= ddc_energy_acc
+            + ($signed(dut.ddc_out_i) * $signed(dut.ddc_out_i))
+            + ($signed(dut.ddc_out_q) * $signed(dut.ddc_out_q));
+        ddc_sample_count = ddc_sample_count + 1;
+    end
+end
+
+// ============================================================================
+// DOPPLER OUTPUT CAPTURE, GOLDEN COMPARISON, AND DUPLICATE DETECTION
 // ============================================================================
 integer doppler_output_count;
 integer doppler_frame_count;
@@ -164,6 +252,18 @@ reg frame_done_prev;
 // CSV output
 integer csv_fd;
 
+// Duplicate detection: one-hot bitmap per (range_bin, doppler_bin)
+// 64 range bins x 32 doppler bins = 2048 bits -> use an array of 64 x 32-bit regs
+reg [31:0] index_seen [0:63];
+integer dup_count;
+
+// Bounds check B2: Doppler energy tracking per range bin
+// For each range bin, track peak |I|+|Q| across all 32 Doppler bins
+// and total energy. Verifies pipeline computes non-trivial Doppler spectra.
+reg [31:0] peak_dbin_mag [0:63]; // max |I|+|Q| across all Doppler bins
+reg [31:0] total_dbin_energy [0:63]; // sum of |I|+|Q| across all 32 Doppler bins
+integer b2_init_idx;
+
 initial begin
     doppler_output_count = 0;
     doppler_frame_count = 0;
@@ -174,6 +274,13 @@ initial begin
     first_doppler_time = 0;
     frame_output_count = 0;
     frame_done_prev = 0;
+    dup_count = 0;
+
+    for (b2_init_idx = 0; b2_init_idx < 64; b2_init_idx = b2_init_idx + 1) begin
+        index_seen[b2_init_idx]      = 32'd0;
+        peak_dbin_mag[b2_init_idx]   = 32'd0;
+        total_dbin_energy[b2_init_idx] = 32'd0;
+    end
 
     csv_fd = $fopen("tb/cosim/rx_final_doppler_out.csv", "w");
     if (csv_fd) $fdisplay(csv_fd, "cycle,range_bin,doppler_bin,output_hex");
@@ -181,7 +288,18 @@ end
 
 // Monitor doppler outputs -- only after reset released
 always @(posedge clk_100m) begin
-    if (reset_n && doppler_valid) begin
+    if (reset_n && doppler_valid) begin : doppler_capture_block
+        // ---- Signed intermediates for golden comparison ----
+        reg signed [16:0] actual_i, actual_q;
+        reg signed [16:0] expected_i, expected_q;
+        reg signed [16:0] err_i_signed, err_q_signed;
+        integer abs_err_i, abs_err_q;
+        integer gidx;
+        reg [31:0] expected_val;
+        // ---- Magnitude intermediates for B2 ----
+        reg signed [16:0] mag_i_signed, mag_q_signed;
+        integer mag_i, mag_q, mag_sum;
+
         doppler_output_count = doppler_output_count + 1;
         frame_output_count = frame_output_count + 1;
 
@@ -209,6 +327,71 @@ always @(posedge clk_100m) begin
         // Progress reporting (every 256 outputs)
         if ((doppler_output_count % 256) == 0)
             $display("[INFO] %0d doppler outputs so far (t=%0t)", doppler_output_count, $time);
+
+        // ---- Golden index computation ----
+        gidx = range_bin_out * 32 + doppler_bin;
+
+        // ---- Duplicate detection (B5) ----
+        if (range_bin_out < 64 && doppler_bin < 32) begin
+            if (index_seen[range_bin_out][doppler_bin]) begin
+                dup_count = dup_count + 1;
+                if (dup_count <= 10)
+                    $display("[WARN] Duplicate index: rbin=%0d dbin=%0d (count=%0d)",
+                             range_bin_out, doppler_bin, dup_count);
+            end
+            index_seen[range_bin_out] = index_seen[range_bin_out] | (32'd1 << doppler_bin);
+        end
+
+        // ---- Bounds check B2: Doppler energy tracking ----
+        mag_i_signed = $signed(doppler_output[15:0]);
+        mag_q_signed = $signed(doppler_output[31:16]);
+        mag_i = (mag_i_signed < 0) ? -mag_i_signed : mag_i_signed;
+        mag_q = (mag_q_signed < 0) ? -mag_q_signed : mag_q_signed;
+        mag_sum = mag_i + mag_q;
+
+        if (range_bin_out < 64) begin
+            total_dbin_energy[range_bin_out] = total_dbin_energy[range_bin_out] + mag_sum;
+            if (mag_sum > peak_dbin_mag[range_bin_out])
+                peak_dbin_mag[range_bin_out] = mag_sum;
+        end
+
+`ifdef GOLDEN_GENERATE
+        // ---- GOLDEN GENERATE: store output ----
+        if (gidx < GOLDEN_ENTRIES)
+            golden_doppler[gidx] = doppler_output;
+`else
+        // ---- GOLDEN COMPARE: check against reference ----
+        if (gidx < GOLDEN_ENTRIES) begin
+            expected_val = golden_doppler[gidx];
+
+            actual_i   = $signed(doppler_output[15:0]);
+            actual_q   = $signed(doppler_output[31:16]);
+            expected_i = $signed(expected_val[15:0]);
+            expected_q = $signed(expected_val[31:16]);
+
+            err_i_signed = actual_i - expected_i;
+            err_q_signed = actual_q - expected_q;
+
+            abs_err_i = (err_i_signed < 0) ? -err_i_signed : err_i_signed;
+            abs_err_q = (err_q_signed < 0) ? -err_q_signed : err_q_signed;
+
+            golden_compare_count = golden_compare_count + 1;
+
+            if (abs_err_i > golden_max_err_i) golden_max_err_i = abs_err_i;
+            if (abs_err_q > golden_max_err_q) golden_max_err_q = abs_err_q;
+
+            if (abs_err_i <= GOLDEN_TOLERANCE && abs_err_q <= GOLDEN_TOLERANCE) begin
+                golden_match_count = golden_match_count + 1;
+            end else begin
+                golden_mismatch_count = golden_mismatch_count + 1;
+                if (golden_mismatch_count <= 20)
+                    $display("[MISMATCH] idx=%0d rbin=%0d dbin=%0d actual=%08h expected=%08h err_i=%0d err_q=%0d",
+                             gidx, range_bin_out, doppler_bin,
+                             doppler_output, expected_val,
+                             abs_err_i, abs_err_q);
+            end
+        end
+`endif
     end
 
     // Track frame completions via doppler_proc -- only after reset
@@ -256,7 +439,7 @@ always @(posedge clk_100m) begin
 end
 
 // ============================================================================
-// MF PIPELINE DEBUG MONITOR — track state transitions
+// MF PIPELINE DEBUG MONITOR -- track state transitions
 // ============================================================================
 reg [3:0] mf_state_prev;
 reg [3:0] chain_state_prev;
@@ -310,7 +493,12 @@ end
 // ~4050 cycles/chirp x 32 chirps = ~130K, plus latency buffer priming,
 // plus Doppler processing time. Set generous timeout.
 
-localparam SIM_TIMEOUT = 2_000_000;  // 2M cycles — full pipeline with multi-segment drain
+localparam SIM_TIMEOUT = 2_000_000;  // 2M cycles -- full pipeline with multi-segment drain
+
+// Maximum DDC RMS energy threshold (B1). 18-bit ADC, squared max ~2^34.
+// With ~100k samples, absolute max energy ~ 100000 * 2^34 ~ 1.7e15 < 2^51.
+// Set a generous ceiling that catches true overflow/garbage.
+localparam [63:0] DDC_MAX_ENERGY = 64'h00FF_FFFF_FFFF_FFFF; // ~2^56
 
 initial begin
     // VCD dump disabled for long integration test -- uncomment for debug
@@ -346,7 +534,16 @@ initial begin
         end
     end
 
-    // ---- RUN CHECKS ----
+    // ---- DUMP GOLDEN FILE (generate mode only) ----
+`ifdef GOLDEN_GENERATE
+    $writememh("tb/golden/golden_doppler.mem", golden_doppler);
+    $display("[GOLDEN_GENERATE] Wrote tb/golden/golden_doppler.mem (%0d entries captured)",
+             doppler_output_count);
+`endif
+
+    // ================================================================
+    // RUN CHECKS
+    // ================================================================
     $display("");
     $display("============================================================");
     $display("RADAR RECEIVER FINAL -- INTEGRATION TEST RESULTS");
@@ -355,38 +552,41 @@ initial begin
     $display("Doppler frames complete: %0d", doppler_frame_count);
     $display("Non-zero outputs:        %0d", nonzero_output_count);
     $display("DDC valid count:         %0d", ddc_valid_count);
+    $display("DDC sample count (tap):  %0d", ddc_sample_count);
     $display("MF output count:         %0d", mf_valid_count);
     $display("Range decim count:       %0d", range_decim_count);
     $display("============================================================");
     $display("");
 
-    // ---- CHECK 1: Pipeline activity ----
+    // ================================================================
+    // STRUCTURAL CHECKS (original 10 checks, kept as-is)
+    // ================================================================
+
+    // ---- CHECK S1: Pipeline activity ----
     check(ddc_valid_count > 0,
-          "DDC produces valid outputs (adc_valid_sync asserted)");
+          "S1: DDC produces valid outputs (adc_valid_sync asserted)");
 
-    // ---- CHECK 2: MF outputs appear ----
+    // ---- CHECK S2: MF outputs appear ----
     check(mf_valid_count > 0,
-          "Matched filter produces outputs (range_valid asserted)");
+          "S2: Matched filter produces outputs (range_valid asserted)");
 
-    // ---- CHECK 3: Range decimator outputs appear ----
+    // ---- CHECK S3: Range decimator outputs appear ----
     check(range_decim_count > 0,
-          "Range bin decimator produces outputs");
+          "S3: Range bin decimator produces outputs");
 
-    // ---- CHECK 4: Doppler outputs appear ----
+    // ---- CHECK S4: Doppler outputs appear ----
     check(doppler_output_count > 0,
-          "Doppler processor produces outputs (doppler_valid asserted)");
+          "S4: Doppler processor produces outputs (doppler_valid asserted)");
 
-    // ---- CHECK 5: Correct output count per frame ----
-    // A complete Doppler frame should produce 64 x 32 = 2048 outputs
+    // ---- CHECK S5: Correct output count per frame (legacy: >= 2048) ----
     if (doppler_frame_count > 0) begin
         check(doppler_output_count >= 2048,
-              "At least 2048 doppler outputs (one full frame: 64 rbins x 32 dbins)");
+              "S5: At least 2048 doppler outputs (one full frame: 64 rbins x 32 dbins)");
     end else begin
-        check(0, "At least 2048 doppler outputs (NO FRAME COMPLETED)");
+        check(0, "S5: At least 2048 doppler outputs (NO FRAME COMPLETED)");
     end
 
-    // ---- CHECK 6: Range bin coverage ----
-    // Count how many unique range bins appeared
+    // ---- CHECK S6: Range bin coverage ----
     begin : count_range_bins
         integer rb_count, rb_i;
         rb_count = 0;
@@ -395,10 +595,10 @@ initial begin
         end
         $display("[INFO] Unique range bins seen: %0d / 64", rb_count);
         check(rb_count == 64,
-              "All 64 range bins present in Doppler output");
+              "S6: All 64 range bins present in Doppler output");
     end
 
-    // ---- CHECK 7: Doppler bin coverage ----
+    // ---- CHECK S7: Doppler bin coverage ----
     begin : count_doppler_bins
         integer db_count, db_i;
         db_count = 0;
@@ -407,28 +607,142 @@ initial begin
         end
         $display("[INFO] Unique Doppler bins seen: %0d / 32", db_count);
         check(db_count == 32,
-              "All 32 Doppler bins present in Doppler output");
+              "S7: All 32 Doppler bins present in Doppler output");
     end
 
-    // ---- CHECK 8: Non-trivial outputs ----
+    // ---- CHECK S8: Non-trivial outputs ----
     check(nonzero_output_count > 0,
-          "At least some Doppler outputs are non-zero");
+          "S8: At least some Doppler outputs are non-zero");
 
-    // ---- CHECK 9: Non-zero fraction ----
-    // With a tone input, we expect most outputs to have some energy
+    // ---- CHECK S9: Non-zero fraction ----
     if (doppler_output_count > 0) begin
         check(nonzero_output_count > doppler_output_count / 4,
-              "More than 25pct of Doppler outputs are non-zero");
+              "S9: More than 25pct of Doppler outputs are non-zero");
     end else begin
-        check(0, "More than 25pct of Doppler outputs are non-zero (NO OUTPUTS)");
+        check(0, "S9: More than 25pct of Doppler outputs are non-zero (NO OUTPUTS)");
     end
 
-    // ---- CHECK 10: Pipeline didn't stall ----
+    // ---- CHECK S10: Pipeline didn't stall ----
     check(ddc_valid_count > 100,
-          "DDC produced substantial output (>100 valid samples)");
+          "S10: DDC produced substantial output (>100 valid samples)");
 
-    // ---- SUMMARY ----
+    // ================================================================
+    // GOLDEN COMPARISON REPORT
+    // ================================================================
+`ifdef GOLDEN_GENERATE
     $display("");
+    $display("Golden comparison:  SKIPPED (GOLDEN_GENERATE mode)");
+    $display("  Wrote golden reference with %0d Doppler samples", doppler_output_count);
+`else
+    $display("");
+    $display("------------------------------------------------------------");
+    $display("GOLDEN COMPARISON (tolerance=%0d LSB)", GOLDEN_TOLERANCE);
+    $display("------------------------------------------------------------");
+    $display("Golden comparison:  %0d/%0d match (tolerance=%0d LSB)",
+             golden_match_count, golden_compare_count, GOLDEN_TOLERANCE);
+    $display("  Mismatches: %0d (I-ch max_err=%0d, Q-ch max_err=%0d)",
+             golden_mismatch_count, golden_max_err_i, golden_max_err_q);
+
+    // CHECK G1: All golden comparisons match
+    if (golden_compare_count > 0) begin
+        check(golden_mismatch_count == 0,
+              "G1: All Doppler outputs match golden reference within tolerance");
+    end else begin
+        check(0, "G1: All Doppler outputs match golden reference (NO COMPARISONS)");
+    end
+`endif
+
+    // ================================================================
+    // BOUNDS CHECKS (active in both modes)
+    // ================================================================
+    $display("");
+    $display("------------------------------------------------------------");
+    $display("BOUNDS CHECKS");
+    $display("------------------------------------------------------------");
+
+    // ---- B1: DDC RMS Energy ----
+    $display("  DDC energy accumulator: %0d (samples=%0d)", ddc_energy_acc, ddc_sample_count);
+    check(ddc_energy_acc > 64'd0,
+          "B1a: DDC RMS energy > 0 (DDC is not dead)");
+    check(ddc_energy_acc < DDC_MAX_ENERGY,
+          "B1b: DDC RMS energy < MAX_THRESHOLD (no overflow/garbage)");
+
+    // ---- B2: Doppler Energy Per Range Bin ----
+    // Every range bin should have non-trivial Doppler energy (peak mag > 0)
+    // and reasonable total energy (not degenerate). This catches a dead MF or
+    // Doppler stage that produces zeros for some range bins.
+    begin : b2_check_block
+        integer b2_rb;
+        integer nontrivial_count;
+        integer min_peak, max_peak;
+        nontrivial_count = 0;
+        min_peak = 32'h7FFFFFFF;
+        max_peak = 0;
+        for (b2_rb = 0; b2_rb < 64; b2_rb = b2_rb + 1) begin
+            if (peak_dbin_mag[b2_rb] > 0)
+                nontrivial_count = nontrivial_count + 1;
+            if (peak_dbin_mag[b2_rb] < min_peak)
+                min_peak = peak_dbin_mag[b2_rb];
+            if (peak_dbin_mag[b2_rb] > max_peak)
+                max_peak = peak_dbin_mag[b2_rb];
+        end
+        $display("  Doppler peak mag: min=%0d max=%0d, non-trivial in %0d/64 range bins",
+                 min_peak, max_peak, nontrivial_count);
+        // All 64 range bins must have non-zero peak Doppler energy
+        check(nontrivial_count == 64,
+              "B2a: All range bins have non-trivial Doppler energy");
+        // Peak magnitude should be bounded (not overflowing to max signed value)
+        check(max_peak < 32000,
+              "B2b: Peak Doppler magnitude within expected range (no overflow)");
+    end
+
+    // ---- B3: Exact Doppler Output Count ----
+    $display("  Doppler output count: %0d (expected 2048)", doppler_output_count);
+    check(doppler_output_count == 2048,
+          "B3: Exact output count = 2048 (64 range x 32 Doppler)");
+
+    // ---- B4: Full Range/Doppler Bin Coverage (exact) ----
+    begin : b4_check_block
+        integer b4_rb_count, b4_db_count, b4_i;
+        b4_rb_count = 0;
+        b4_db_count = 0;
+        for (b4_i = 0; b4_i < 64; b4_i = b4_i + 1) begin
+            if (range_bin_seen[b4_i]) b4_rb_count = b4_rb_count + 1;
+        end
+        for (b4_i = 0; b4_i < 32; b4_i = b4_i + 1) begin
+            if (doppler_bin_seen[b4_i]) b4_db_count = b4_db_count + 1;
+        end
+        check(b4_rb_count == 64 && b4_db_count == 32,
+              "B4: Full bin coverage: 64 range x 32 Doppler");
+    end
+
+    // ---- B5: No Duplicate Indices ----
+    $display("  Duplicate (rbin, dbin) indices: %0d", dup_count);
+    check(dup_count == 0,
+          "B5: No duplicate (rbin, dbin) indices");
+
+    // ================================================================
+    // FINAL SUMMARY
+    // ================================================================
+    $display("");
+    $display("============================================================");
+    $display("INTEGRATION TEST -- GOLDEN COMPARISON + BOUNDS");
+    $display("============================================================");
+`ifdef GOLDEN_GENERATE
+    $display("Mode: GOLDEN_GENERATE (reference dump, comparison skipped)");
+`else
+    $display("Golden comparison:  %0d/%0d match (tolerance=%0d LSB)",
+             golden_match_count, golden_compare_count, GOLDEN_TOLERANCE);
+    $display("  Mismatches: %0d (I-ch max_err=%0d, Q-ch max_err=%0d)",
+             golden_mismatch_count, golden_max_err_i, golden_max_err_q);
+`endif
+    $display("Bounds checks:");
+    $display("  B1: DDC RMS energy in range [%0d, %0d]",
+             (ddc_energy_acc > 0) ? 1 : 0, DDC_MAX_ENERGY);
+    $display("  B2: Doppler energy per range bin check");
+    $display("  B3: Exact output count: %0d", doppler_output_count);
+    $display("  B4: Full bin coverage");
+    $display("  B5: Duplicate index count: %0d", dup_count);
     $display("============================================================");
     $display("SUMMARY: %0d / %0d tests passed", pass_count, total_tests);
     if (fail_count == 0)
