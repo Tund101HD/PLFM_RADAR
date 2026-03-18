@@ -1,14 +1,15 @@
 # AERIS-10 FPGA Constraint Files
 
-## Three Targets
+## Four Targets
 
 | File | Device | Package | Purpose |
 |------|--------|---------|---------|
 | `xc7a50t_ftg256.xdc` | XC7A50T-2FTG256I | FTG256 (256-ball BGA) | Upstream author's board (copy of `cntrt.xdc`) |
 | `xc7a200t_fbg484.xdc` | XC7A200T-2FBG484I | FBG484 (484-ball BGA) | Production board (new PCB design) |
 | `te0712_te0701_minimal.xdc` | XC7A200T-2FBG484I | FBG484 (484-ball BGA) | Trenz dev split target (minimal clock/reset + LEDs/status) |
+| `te0713_te0701_minimal.xdc` | XC7A200T-2FBG484C | FBG484 (484-ball BGA) | Trenz alternate SoM target (minimal clock + FMC status outputs) |
 
-## Why Three Files
+## Why Four Files
 
 The upstream prototype uses a smaller XC7A50T in an FTG256 package. The production
 AERIS-10 radar migrates to the XC7A200T for more logic, BRAM, and DSP resources.
@@ -19,6 +20,10 @@ The Trenz TE0712/TE0701 path uses the same FPGA part as production but different
 pinout and peripherals. The dev target is split into its own top wrapper
 (`radar_system_top_te0712_dev.v`) and minimal constraints file to avoid accidental mixing
 of production pin assignments during bring-up.
+
+The Trenz TE0713/TE0701 path supports situations where TE0712 lead time is prohibitive.
+TE0713 uses XC7A200T-2FBG484C (commercial temp grade) and requires separate clock mapping,
+so it has its own dev top and XDC.
 
 ## Bank Voltage Assignments
 
@@ -73,6 +78,9 @@ read_xdc constraints/xc7a50t_ftg256.xdc
 
 # For Trenz TE0712/TE0701 split target:
 read_xdc constraints/te0712_te0701_minimal.xdc
+
+# For Trenz TE0713/TE0701 split target:
+read_xdc constraints/te0713_te0701_minimal.xdc
 ```
 
 ## Top Modules by Target
@@ -82,6 +90,7 @@ read_xdc constraints/te0712_te0701_minimal.xdc
 | Upstream FTG256 | `radar_system_top` | Legacy board support |
 | Production FBG484 | `radar_system_top` | Main AERIS-10 board |
 | Trenz TE0712/TE0701 | `radar_system_top_te0712_dev` | Minimal bring-up wrapper while pinout/peripherals are migrated |
+| Trenz TE0713/TE0701 | `radar_system_top_te0713_dev` | Alternate SoM wrapper (TE0713 clock mapping) |
 
 ## Trenz Split Status
 
@@ -114,6 +123,9 @@ Use the dedicated script for the split dev target:
 
 ```bash
 vivado -mode batch -source scripts/build_te0712_dev.tcl
+
+# TE0713/TE0701 target
+vivado -mode batch -source scripts/build_te0713_dev.tcl
 ```
 
 Outputs:
@@ -121,6 +133,12 @@ Outputs:
 - Reports: `vivado_te0712_dev/reports/`
 - Top module: `radar_system_top_te0712_dev`
 - Constraint file: `constraints/te0712_te0701_minimal.xdc`
+
+TE0713 outputs:
+- Project directory: `vivado_te0713_dev/`
+- Reports: `vivado_te0713_dev/reports/`
+- Top module: `radar_system_top_te0713_dev`
+- Constraint file: `constraints/te0713_te0701_minimal.xdc`
 
 ## Notes
 
