@@ -41,6 +41,7 @@ import sys
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 import contract_parser as cp  # noqa: E402
+import adar1000_vm_reference as adar_vm  # noqa: E402
 
 # Also add the GUI dir to import radar_protocol
 sys.path.insert(0, str(cp.GUI_DIR))
@@ -75,6 +76,78 @@ if _in_ci:
             "C++ compiler is required in CI but was not found. "
             "Ensure build-essential is installed."
         )
+
+
+def _strip_cxx_comments_and_strings(src: str) -> str:
+    """Return src with all C/C++ comments and string/char literals removed.
+
+    Tokenising state machine with four states:
+      * CODE              — default; watches for `"`, `'`, `//`, `/*`
+      * STRING ("...")    — handles `\\"` and `\\\\` escapes
+      * CHAR   ('...')    — handles `\\'` and `\\\\` escapes
+      * LINE_COMMENT      — until next `\\n`
+      * BLOCK_COMMENT     — until next `*/`
+
+    Used by test_vm_gain_table_is_not_reintroduced to ensure the substring
+    "VM_GAIN" appearing only inside an explanatory comment or a string
+    literal does NOT count as code reintroduction. We replace stripped
+    regions with a single space so token boundaries (and line counts, by
+    approximation — newlines preserved) are not collapsed.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(src)
+    CODE, STRING, CHAR, LINE_C, BLOCK_C = 0, 1, 2, 3, 4
+    state = CODE
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if state == CODE:
+            if c == "/" and nxt == "/":
+                state = LINE_C
+                i += 2
+            elif c == "/" and nxt == "*":
+                state = BLOCK_C
+                i += 2
+            elif c == '"':
+                state = STRING
+                i += 1
+            elif c == "'":
+                state = CHAR
+                i += 1
+            else:
+                out.append(c)
+                i += 1
+        elif state == STRING:
+            if c == "\\" and i + 1 < n:
+                i += 2  # skip escape pair (handles \" and \\)
+            elif c == '"':
+                state = CODE
+                i += 1
+            else:
+                i += 1
+        elif state == CHAR:
+            if c == "\\" and i + 1 < n:
+                i += 2
+            elif c == "'":
+                state = CODE
+                i += 1
+            else:
+                i += 1
+        elif state == LINE_C:
+            if c == "\n":
+                out.append("\n")  # preserve line numbering
+                state = CODE
+            i += 1
+        elif state == BLOCK_C:
+            if c == "*" and nxt == "/":
+                state = CODE
+                i += 2
+            else:
+                if c == "\n":
+                    out.append("\n")
+                i += 1
+    return "".join(out)
 
 
 def _parse_hex_results(text: str) -> list[dict[str, str]]:
@@ -663,6 +736,204 @@ class TestTier1STM32SettingsPacket:
         if not flag:
             pytest.skip("USBHandler.cpp not available")
         assert flag == [23, 46, 158, 237], f"Start flag: {flag}"
+
+
+# ===================================================================
+# TIER 2: ADAR1000 Vector Modulator Lookup-Table Ground Truth
+# ===================================================================
+#
+# Cross-layer contract: the firmware constants
+#   ADAR1000Manager::VM_I[128] / VM_Q[128]
+# (in 9_Firmware/9_1_Microcontroller/9_1_1_C_Cpp_Libraries/ADAR1000_Manager.cpp)
+# MUST equal the byte values published in the ADAR1000 datasheet Rev. B,
+# Tables 13-16 page 34 ("Phase Shifter Programming"), on a uniform 2.8125 deg
+# grid (index N == phase N * 360/128 deg).
+#
+# Independent ground truth lives in tools/verify_adar1000_vm_tables.py
+# (transcribed from the datasheet, cross-checked against the ADI Linux
+# beamformer driver as a secondary source). This test imports that
+# reference and asserts a byte-exact match.
+#
+# Historical bug guarded against: from initial commit through PR #94 the
+# arrays shipped as empty placeholders ("// ... (same as in your original
+# file)"), so every adarSetRxPhase / adarSetTxPhase call wrote I=Q=0 and
+# beam steering was non-functional. A separate VM_GAIN[128] table was
+# declared but never read anywhere; this test also enforces its removal so
+# it cannot be reintroduced and silently shadow real bugs.
+
+class TestTier2Adar1000VmTableGroundTruth:
+    """Firmware ADAR1000 VM_I/VM_Q must match datasheet ground truth byte-exact."""
+
+    @pytest.fixture(scope="class")
+    def cpp_source(self):
+        path = (
+            cp.REPO_ROOT
+            / "9_Firmware"
+            / "9_1_Microcontroller"
+            / "9_1_1_C_Cpp_Libraries"
+            / "ADAR1000_Manager.cpp"
+        )
+        assert path.is_file(), f"Firmware source missing: {path}"
+        return path.read_text()
+
+    def test_ground_truth_table_shape(self):
+        """Sanity-check the imported reference (defends against import-path mishap)."""
+        gt = adar_vm.GROUND_TRUTH
+        assert len(gt) == 128, "Ground-truth table must have exactly 128 entries"
+        # Each row is (deg_int, deg_frac_e4, vm_i_byte, vm_q_byte)
+        for k, row in enumerate(gt):
+            assert len(row) == 4, f"Row {k} malformed: {row}"
+            assert 0 <= row[2] <= 0xFF, f"VM_I[{k}] out of byte range: {row[2]:#x}"
+            assert 0 <= row[3] <= 0xFF, f"VM_Q[{k}] out of byte range: {row[3]:#x}"
+            # Byte format: bits[7:6] reserved zero, bits[5] polarity, bits[4:0] mag
+            assert (row[2] & 0xC0) == 0, f"VM_I[{k}] reserved bits set: {row[2]:#x}"
+            assert (row[3] & 0xC0) == 0, f"VM_Q[{k}] reserved bits set: {row[3]:#x}"
+
+    def test_ground_truth_byte_format(self):
+        """Transcription self-check: every VM_I/VM_Q byte has reserved bits clear."""
+        errors = adar_vm.check_byte_format("VM_I_REF", adar_vm.VM_I_REF)
+        errors += adar_vm.check_byte_format("VM_Q_REF", adar_vm.VM_Q_REF)
+        assert not errors, (
+            "Byte-format violations in embedded GROUND_TRUTH (likely transcription "
+            "typo from ADAR1000 datasheet Tables 13-16):\n  " + "\n  ".join(errors)
+        )
+
+    def test_ground_truth_uniform_2p8125_deg_grid(self):
+        """Transcription self-check: angles form a uniform 2.8125 deg grid.
+
+        This is the assumption that lets the firmware use `VM_*[phase % 128]`
+        as a direct index (no nearest-neighbour search). If the embedded
+        angles drift off the grid, the firmware's indexing model is wrong.
+        """
+        errors = adar_vm.check_uniform_2p8125_deg_step()
+        assert not errors, (
+            "Non-uniform angle grid in GROUND_TRUTH:\n  " + "\n  ".join(errors)
+        )
+
+    def test_ground_truth_quadrant_symmetry(self):
+        """Transcription self-check: phi and phi+180 deg have same magnitude,
+        opposite polarity. Catches swapped/rotated rows in the table.
+        """
+        errors = adar_vm.check_quadrant_symmetry()
+        assert not errors, (
+            "Quadrant-symmetry violation in GROUND_TRUTH (table rows may be "
+            "transposed or mis-transcribed):\n  " + "\n  ".join(errors)
+        )
+
+    def test_ground_truth_cardinal_points(self):
+        """Transcription self-check: the four cardinal phases (0, 90, 180,
+        270 deg) match the datasheet-published extrema exactly.
+        """
+        errors = adar_vm.check_cardinal_points()
+        assert not errors, (
+            "Cardinal-point mismatch in GROUND_TRUTH vs ADAR1000 datasheet "
+            "Tables 13-16:\n  " + "\n  ".join(errors)
+        )
+
+    def test_firmware_vm_i_matches_datasheet(self, cpp_source):
+        gt = adar_vm.GROUND_TRUTH
+        firmware = adar_vm.parse_array(cpp_source, "VM_I")
+        assert firmware is not None, (
+            "Could not parse VM_I[128] from ADAR1000_Manager.cpp; "
+            "definition pattern may have drifted"
+        )
+        assert len(firmware) == 128, (
+            f"VM_I has {len(firmware)} entries, expected 128. "
+            "Empty placeholder regression — every phase write would emit I=0 "
+            "and beam steering would be silently broken."
+        )
+        mismatches = [
+            (k, firmware[k], gt[k][2])
+            for k in range(128)
+            if firmware[k] != gt[k][2]
+        ]
+        assert not mismatches, (
+            f"VM_I diverges from datasheet at {len(mismatches)} indices; "
+            f"first 5: {mismatches[:5]}"
+        )
+
+    def test_firmware_vm_q_matches_datasheet(self, cpp_source):
+        gt = adar_vm.GROUND_TRUTH
+        firmware = adar_vm.parse_array(cpp_source, "VM_Q")
+        assert firmware is not None, (
+            "Could not parse VM_Q[128] from ADAR1000_Manager.cpp; "
+            "definition pattern may have drifted"
+        )
+        assert len(firmware) == 128, (
+            f"VM_Q has {len(firmware)} entries, expected 128. "
+            "Empty placeholder regression — every phase write would emit Q=0."
+        )
+        mismatches = [
+            (k, firmware[k], gt[k][3])
+            for k in range(128)
+            if firmware[k] != gt[k][3]
+        ]
+        assert not mismatches, (
+            f"VM_Q diverges from datasheet at {len(mismatches)} indices; "
+            f"first 5: {mismatches[:5]}"
+        )
+
+    def test_vm_gain_table_is_not_reintroduced(self, cpp_source):
+        """Dead-code regression guard: VM_GAIN[128] must not exist as code.
+
+        The ADAR1000 vector modulator has no separate gain register; magnitude
+        is bits[4:0] of the I/Q bytes themselves. Per-channel VGA gain uses
+        registers CHx_RX_GAIN (0x10-0x13) / CHx_TX_GAIN (0x1C-0x1F) written
+        directly by adarSetRxVgaGain / adarSetTxVgaGain. A VM_GAIN[] array
+        was declared in early development, never populated, never read, and
+        was removed in PR fix/adar1000-vm-tables. Reintroducing it would
+        suggest (falsely) that an extra lookup is needed and could mask the
+        real signal path.
+
+        Uses a tokenising comment/string stripper so that the historical
+        explanation comment in the cpp file, as well as any string literal
+        containing the substring "VM_GAIN", does not trip the check.
+        """
+        stripped = _strip_cxx_comments_and_strings(cpp_source)
+        assert "VM_GAIN" not in stripped, (
+            "VM_GAIN symbol reappeared in ADAR1000_Manager.cpp executable code. "
+            "This array has no hardware backing and must not be reintroduced. "
+            "If you need to scale phase-state magnitude, modify VM_I/VM_Q "
+            "bits[4:0] directly per the datasheet."
+        )
+
+    def test_adversarial_corruption_is_detected(self):
+        """Adversarial self-test: a flipped byte in firmware MUST fail comparison.
+
+        Defends against silent bypass — e.g. a future refactor that mocks
+        parse_array() or compares len() only. We synthesise a corrupted cpp
+        source string, run the same parser, and assert mismatch is detected.
+        """
+        gt = adar_vm.GROUND_TRUTH
+        # Build a minimal valid-looking cpp snippet with one corrupted byte.
+        good_i = ", ".join(f"0x{gt[k][2]:02X}" for k in range(128))
+        good_q = ", ".join(f"0x{gt[k][3]:02X}" for k in range(128))
+        snippet_good = (
+            f"const uint8_t ADAR1000Manager::VM_I[128] = {{ {good_i} }};\n"
+            f"const uint8_t ADAR1000Manager::VM_Q[128] = {{ {good_q} }};\n"
+        )
+        # Sanity: the unmodified snippet must parse and match.
+        parsed_i = adar_vm.parse_array(snippet_good, "VM_I")
+        assert parsed_i is not None and len(parsed_i) == 128
+        assert all(parsed_i[k] == gt[k][2] for k in range(128)), (
+            "Self-test setup error: golden snippet does not match GROUND_TRUTH"
+        )
+        # Now flip the low bit of VM_I[42] and confirm detection.
+        corrupted_byte = gt[42][2] ^ 0x01
+        bad_i = ", ".join(
+            f"0x{(corrupted_byte if k == 42 else gt[k][2]):02X}"
+            for k in range(128)
+        )
+        snippet_bad = (
+            f"const uint8_t ADAR1000Manager::VM_I[128] = {{ {bad_i} }};\n"
+            f"const uint8_t ADAR1000Manager::VM_Q[128] = {{ {good_q} }};\n"
+        )
+        parsed_bad = adar_vm.parse_array(snippet_bad, "VM_I")
+        assert parsed_bad is not None and len(parsed_bad) == 128
+        assert parsed_bad[42] != gt[42][2], (
+            "Adversarial self-test FAILED: corrupted byte at index 42 was "
+            "not detected by parse_array. The cross-layer test is bypassable."
+        )
 
 
 # ===================================================================

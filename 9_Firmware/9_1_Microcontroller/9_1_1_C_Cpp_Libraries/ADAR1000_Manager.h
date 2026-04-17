@@ -116,10 +116,12 @@ public:
     bool beam_sweeping_active_ = false;
     uint32_t last_beam_update_time_ = 0;
 
-    // Lookup tables
+    // Vector Modulator lookup tables (see ADAR1000_Manager.cpp for provenance).
+    // Indexed as VM_*[phase % 128] on a uniform 2.8125 deg grid.
+    // No VM_GAIN[] table exists: VM magnitude is bits [4:0] of the I/Q bytes
+    // themselves; per-channel VGA gain uses a separate register.
     static const uint8_t VM_I[128];
     static const uint8_t VM_Q[128];
-    static const uint8_t VM_GAIN[128];
 
     // Named defaults for the ADTR1107 and ADAR1000 power sequence.
     static constexpr uint8_t kDefaultTxVgaGain = 0x7F;
